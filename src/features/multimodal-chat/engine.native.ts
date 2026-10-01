@@ -95,8 +95,6 @@ let opChain: Promise<void> = Promise.resolve();
 let opPending = 0;
 /** Bumped by every loadModel/unloadModel call: only the latest request is allowed to change the model. */
 let loadSeq = 0;
-/** loadSeq of an unload scheduled by the last release(); retain() cancels it while it is still the latest. */
-let autoUnloadSeq: number | null = null;
 
 let downloadChain: Promise<void> = Promise.resolve();
 const pendingDownloads = new Map<ModelId, Promise<void>>();
@@ -388,61 +386,108 @@ function teardown() {
   tokenizeBaseline = 0;
 }
 
+/** The latest loadModel request (for de-duplicating repeated calls). null after an unload request. */
+let latestLoad: { id: ModelId; seq: number } | null = null;
+
 /**
- * Latest request wins: every call bumps loadSeq, and the op bails out after each await if a newer
- * loadModel/unloadModel was issued (a Model that finished loading in the meantime is destroyed).
- * Download runs outside the op queue and before teardown, so the current model stays loaded and usable
- * while another model downloads, and stays loaded if that download fails.
+ * Makes sure both files of `id` are cached, through the shared download queue.
+ * Returns false when the request went stale or the download failed. On failure (and only when this request is
+ * still the latest) it finalizes state itself: a ready model is kept, otherwise loadState becomes download_failed.
+ */
+async function ensureDownloaded(id: ModelId, isStale: () => boolean): Promise<boolean> {
+  refreshDownloads();
+  if (downloads[id].status === 'downloaded') return true;
+  const info = getModelInfo(id);
+  if (state.loadState.status !== 'ready') {
+    setState({
+      loadState: { status: 'downloading', modelId: id, downloadedBytes: 0, totalBytes: info.downloadBytes, progress: 0 },
+    });
+  }
+  try {
+    await downloadInternal(id);
+  } catch (e) {
+    if (isStale()) return false;
+    refreshDownloads();
+    setState({
+      pendingModelId: null,
+      // Keep a ready model as-is; the failure is visible in models[].download.
+      ...(state.loadState.status === 'ready'
+        ? {}
+        : { loadState: { status: 'error', modelId: id, code: 'download_failed', message: errorMessage(e) } }),
+    });
+    return false;
+  }
+  return !isStale();
+}
+
+/** A direct downloadFiles() call (outside downloadInternal) can leave downloads[id] at 'downloading'. */
+function settleDirectDownloadState(id: ModelId) {
+  if (downloads[id].status === 'downloading' && !pendingDownloads.has(id)) {
+    downloads[id] = { status: 'notDownloaded', cachedBytes: 0 };
+  }
+  refreshDownloads();
+}
+
+/**
+ * Latest request wins. Every loadModel/unloadModel request bumps loadSeq, and an op bails out after each await
+ * if a newer request exists (a Model/Chat that finished in the meantime is destroyed).
+ *
+ * Invariant: loadSeq is bumped ONLY by a request that will itself finalize loadState/pendingModelId
+ * (loadModel, unloadModel, or the auto-unload at the moment it actually runs). Therefore every stale
+ * return below is covered by a newer request that sets the final state. Stale paths:
+ *  - download phase (ensureDownloaded) -> newer request finalizes
+ *  - op start / after stopAndWait -> nothing changed yet, newer request finalizes
+ *  - after teardown (loadState 'loading') -> newer load sets its own loadState, newer unload sets idle
+ * Exceptions that do not bump: de-duplicated repeat loadModel(id) (no-op, the in-flight request stays latest).
+ *
+ * Download runs before teardown, so the current model stays loaded and usable while another model downloads,
+ * and stays loaded if that download fails.
  */
 async function loadModel(id: ModelId): Promise<void> {
+  const ls = state.loadState;
+  // De-dup: the latest request is already a load of `id` that is downloading/loading.
+  if (
+    latestLoad &&
+    latestLoad.id === id &&
+    latestLoad.seq === loadSeq &&
+    state.pendingModelId === id &&
+    (ls.status === 'ready' ? ls.modelId !== id : true)
+  ) {
+    return;
+  }
+
   const mySeq = ++loadSeq;
+  latestLoad = { id, seq: mySeq };
   const isStale = () => mySeq !== loadSeq;
 
-  refreshDownloads();
-  if (state.loadState.status === 'ready' && state.loadState.modelId === id && chat) {
+  if (ls.status === 'ready' && ls.modelId === id && chat) {
     setState({ pendingModelId: null });
     return;
   }
   const info = getModelInfo(id);
   setState({ pendingModelId: id });
 
-  if (downloads[id].status !== 'downloaded') {
-    if (state.loadState.status !== 'ready') {
-      setState({
-        loadState: { status: 'downloading', modelId: id, downloadedBytes: 0, totalBytes: info.downloadBytes, progress: 0 },
-      });
-    }
-    try {
-      await downloadInternal(id);
-    } catch (e) {
-      if (isStale()) return;
-      refreshDownloads();
-      setState({
-        pendingModelId: null,
-        // Keep a ready model as-is; the failure is visible in models[].download.
-        ...(state.loadState.status === 'ready'
-          ? {}
-          : { loadState: { status: 'error', modelId: id, code: 'download_failed', message: errorMessage(e) } }),
-      });
-      return;
-    }
-    if (isStale()) return;
-  }
+  if (!(await ensureDownloaded(id, isStale))) return;
 
   await enqueueOp(async () => {
     if (isStale()) return;
     await stopAndWait();
     if (isStale()) return;
+    // The OS may have purged Library/Caches since the first check: re-download through the queue
+    // while the current model is still loaded.
+    if (!(await ensureDownloaded(id, isStale))) return;
 
     teardown();
     setState({ loadState: { status: 'loading', modelId: id }, messages: [], contextUsage: null, isGenerating: false });
 
     let loaded: NwModel | null = null;
     let created: NwChat | null = null;
+    let phase: LoadErrorCode = 'download_failed';
     try {
-      // Cache hit -> returns local paths without network. Re-downloads if the OS purged the cache meanwhile.
+      // Cache hit -> local paths, no network, no progress callbacks.
       const paths = await downloadFiles(info);
       if (isStale()) return;
+      phase = 'load_failed';
       const started = performance.now();
       loaded = await Model.load({ modelPath: paths.modelPath, projectionModelPath: paths.projectionPath, useGpu: true });
       if (isStale()) {
@@ -477,29 +522,46 @@ async function loadModel(id: ModelId): Promise<void> {
       if (isStale()) return;
       teardown();
       setState({
-        loadState: { status: 'error', modelId: id, code: classifyError(e, 'load_failed'), message: errorMessage(e) },
+        loadState: { status: 'error', modelId: id, code: classifyError(e, phase), message: errorMessage(e) },
         pendingModelId: null,
       });
     } finally {
-      refreshDownloads();
+      settleDirectDownloadState(id);
     }
+  });
+}
+
+async function unloadOp(mySeq: number) {
+  if (mySeq !== loadSeq) return;
+  await stopAndWait();
+  if (mySeq !== loadSeq) return;
+  teardown();
+  setState({
+    loadState: { status: 'idle' },
+    pendingModelId: null,
+    messages: [],
+    contextUsage: null,
+    isGenerating: false,
   });
 }
 
 function unloadModel(): Promise<void> {
   const mySeq = ++loadSeq;
+  latestLoad = null;
+  return enqueueOp(() => unloadOp(mySeq));
+}
+
+/**
+ * Unload requested by the last hook unmounting. It does NOT bump loadSeq when queued: it decides when it
+ * actually runs. If a hook re-mounted meanwhile (holders > 0) it is skipped and nothing becomes stale;
+ * otherwise it becomes the latest request at that moment and finalizes state (idle).
+ */
+function autoUnload(): Promise<void> {
   return enqueueOp(async () => {
-    if (mySeq !== loadSeq) return;
-    await stopAndWait();
-    if (mySeq !== loadSeq) return;
-    teardown();
-    setState({
-      loadState: { status: 'idle' },
-      pendingModelId: null,
-      messages: [],
-      contextUsage: null,
-      isGenerating: false,
-    });
+    if (holders > 0) return;
+    const mySeq = ++loadSeq;
+    latestLoad = null;
+    await unloadOp(mySeq);
   });
 }
 
@@ -664,24 +726,17 @@ function retain(): () => void {
     clearTimeout(releaseTimer);
     releaseTimer = null;
   }
-  // An auto-unload already queued (screen left and re-entered quickly) is cancelled while it is still
-  // the latest request. Bumping loadSeq makes its op bail out.
-  if (autoUnloadSeq !== null && autoUnloadSeq === loadSeq) {
-    loadSeq += 1;
-  }
-  autoUnloadSeq = null;
   let released = false;
   return () => {
     if (released) return;
     released = true;
     holders -= 1;
     if (holders > 0) return;
-    // Deferred so StrictMode / fast-refresh remounts do not unload the model.
+    // Deferred so StrictMode / fast-refresh remounts do not even queue an unload.
+    // An unload that is already queued re-checks holders when it runs (autoUnload).
     releaseTimer = setTimeout(() => {
       releaseTimer = null;
-      if (holders !== 0) return;
-      void unloadModel();
-      autoUnloadSeq = loadSeq;
+      if (holders === 0) void autoUnload();
     }, 0);
   };
 }

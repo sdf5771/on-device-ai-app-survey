@@ -105,7 +105,7 @@ export type ResponseMetrics = {
   contextUsed: number;
   /** true when the response was cut by stop() (user, or app going to background). */
   stopped: boolean;
-  /** true when generation was cut by the output-token cap (SendInput.maxOutputTokens). */
+  /** true when generation was cut by the output-token cap (SendInput.maxOutputTokens). A user stop after the cap was hit still reports status 'done' + hitTokenCap. */
   hitTokenCap: boolean;
   /** The cap that applied to this response. */
   maxOutputTokens: number;
@@ -123,7 +123,10 @@ export type ChatMessage = {
   imageUri?: string;
   /** assistant only. */
   status?: ChatMessageStatus;
-  /** assistant only, set when status is done/stopped. */
+  /**
+   * assistant only. Set when status is 'done', and when 'stopped' after generation started.
+   * Absent for a 'stopped' message whose stop came before ask() (nothing was generated, nothing to measure).
+   */
   metrics?: ResponseMetrics;
   /** assistant only, set when status is error. */
   error?: string;
@@ -150,7 +153,10 @@ export type EngineSnapshot = {
   loadState: LoadState;
   messages: ChatMessage[];
   isGenerating: boolean;
-  /** true while a load/unload/reset op is queued or running. send() is ignored while true. */
+  /**
+   * true while a load/unload/reset op is queued or running. send() is ignored while true.
+   * false during loadModel's download phase (the current model stays usable) -> use pendingModelId for "switching" UI.
+   */
   isBusy: boolean;
   /**
    * Model requested by the latest loadModel() that is not ready yet (downloading or loading).
