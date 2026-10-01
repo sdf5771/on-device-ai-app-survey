@@ -8,7 +8,9 @@
     "scheme": "ondeviceaiappsurvey",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "deploymentTarget": "18.5",
+      "bundleIdentifier": "com.seobisback.on-device-ai-app-survey"
     },
     "android": {
       "adaptiveIcon": {
