@@ -28,21 +28,21 @@ export function fileUriToPath(uri: string): string {
 export async function prepareImage(uri: string): Promise<PreparedImage> {
   const started = performance.now();
 
-  const probe = ImageManipulator.manipulate(uri);
-  const original = await probe.renderAsync();
+  // Decode once: the first render gives the size, and the same ImageRef is the source of the resize.
+  const loader = ImageManipulator.manipulate(uri);
+  const original = await loader.renderAsync();
   const { width, height } = original;
-  original.release();
-  probe.release();
 
-  const context = ImageManipulator.manipulate(uri);
-  const longest = Math.max(width, height);
-  if (longest > MAX_IMAGE_SIDE) {
+  const context = ImageManipulator.manipulate(original);
+  if (Math.max(width, height) > MAX_IMAGE_SIDE) {
     context.resize(width >= height ? { width: MAX_IMAGE_SIDE } : { height: MAX_IMAGE_SIDE });
   }
   const rendered = await context.renderAsync();
   const result = await rendered.saveAsync({ format: SaveFormat.JPEG, compress: JPEG_QUALITY });
   rendered.release();
   context.release();
+  original.release();
+  loader.release();
 
   return {
     path: fileUriToPath(result.uri),

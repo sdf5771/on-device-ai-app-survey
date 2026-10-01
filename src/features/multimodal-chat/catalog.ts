@@ -18,6 +18,12 @@ const RUNTIME_OVERHEAD_BYTES = 400 * MB;
  */
 export const CONTEXT_SIZE = 4096;
 
+/**
+ * Safety cap on output length per response (runaway generation guard). Overridable per send().
+ * research D-2 benchmark uses 256.
+ */
+export const DEFAULT_MAX_OUTPUT_TOKENS = 1024;
+
 /** Default model when nothing else is chosen (PM decision 2026-10-01: Qwen3.5-2B is the main candidate). */
 export const DEFAULT_MODEL_ID: ModelId = 'qwen3.5-2b';
 

@@ -91,7 +91,7 @@ export type ResponseMetrics = {
   totalMs: number;
   /** first token -> last token (ms). */
   decodeMs: number;
-  /** Output tokens counted with chat.tokenize(responseText) (not stream event count). */
+  /** Output tokens counted with chat.tokenize(responseText) minus the tokenize('') baseline (BOS), not stream event count. */
   outputTokens: number;
   /** Decode speed: (outputTokens - 1) / decodeMs * 1000. 0 when < 2 tokens. */
   tokensPerSec: number;
@@ -103,8 +103,12 @@ export type ResponseMetrics = {
   imagePrepMs?: number;
   /** Context usage after this response. */
   contextUsed: number;
-  /** true when the response was cut by stop(). */
+  /** true when the response was cut by stop() (user, or app going to background). */
   stopped: boolean;
+  /** true when generation was cut by the output-token cap (SendInput.maxOutputTokens). */
+  hitTokenCap: boolean;
+  /** The cap that applied to this response. */
+  maxOutputTokens: number;
   modelId: ModelId;
 };
 
@@ -125,7 +129,16 @@ export type ChatMessage = {
   error?: string;
 };
 
-export type SendInput = { text: string; imageUri?: string };
+export type SendInput = {
+  text: string;
+  imageUri?: string;
+  /**
+   * Output cap. stopGeneration() is called once this many stream events arrived
+   * (events <= tokens, so the real outputTokens can slightly exceed it). Default DEFAULT_MAX_OUTPUT_TOKENS (1024).
+   * Use 256 for the research D-2 benchmark condition.
+   */
+  maxOutputTokens?: number;
+};
 
 export type ContextUsage = { used: number; size: number };
 
@@ -137,6 +150,13 @@ export type EngineSnapshot = {
   loadState: LoadState;
   messages: ChatMessage[];
   isGenerating: boolean;
+  /** true while a load/unload/reset op is queued or running. send() is ignored while true. */
+  isBusy: boolean;
+  /**
+   * Model requested by the latest loadModel() that is not ready yet (downloading or loading).
+   * While it downloads, the previous model stays loaded and usable (loadState keeps 'ready').
+   */
+  pendingModelId: ModelId | null;
   contextUsage: ContextUsage | null;
 };
 

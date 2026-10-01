@@ -5,17 +5,28 @@
  *
  * Library facts used here (react-native-nobodywho 4.0.0 source, checked 2026-10-01):
  * - downloadModel() returns the cached path immediately when the file exists (core huggingface.rs fetch_to_path).
- *   Cache key = <cache>/nobodywho/models/<owner>/<repo>/<file>; partial downloads are `*.part` temp files.
+ *   Cache key = <cache>/nobodywho/models/<owner>/<repo>/<file>; partial downloads are `<file>.<rand>.part` temp files.
  * - Model.load() downloads model and mmproj sequentially with separate progress callbacks, so we download
  *   each file explicitly first (clear per-file progress) and load from local paths (loadMs excludes download).
  * - new Chat() is synchronous and may throw "Not enough memory for context" (core memory.rs).
  * - Stream errors are thrown from nextToken(); stopGeneration() ends the stream normally.
+ * - chat.ask() resets the worker's should_stop flag when the turn starts (core chat.rs), so a stop sent
+ *   before generation actually begins is lost -> we re-send it from inside the stream loop.
+ * - tokenize(text) may prepend BOS (core tokenizer.rs tokenize_text AddBos) -> subtract tokenize('') baseline.
  * - No delete API, no available-memory API, no perf stats API.
  */
 import * as Device from 'expo-device';
-import { File } from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
+import { AppState } from 'react-native';
 
-import { assessFit, CONTEXT_SIZE, getDeviceMemoryInfo, getModelInfo, MODEL_CATALOG } from './catalog';
+import {
+  assessFit,
+  CONTEXT_SIZE,
+  DEFAULT_MAX_OUTPUT_TOKENS,
+  getDeviceMemoryInfo,
+  getModelInfo,
+  MODEL_CATALOG,
+} from './catalog';
 import { prepareImage } from './image.native';
 import type {
   ChatMessage,
@@ -63,6 +74,8 @@ let state: EngineSnapshot = {
   loadState: { status: 'idle' },
   messages: [],
   isGenerating: false,
+  isBusy: false,
+  pendingModelId: null,
   contextUsage: null,
 };
 state = { ...state, models: buildModels(state.loadState) };
@@ -71,11 +84,25 @@ const listeners = new Set<() => void>();
 
 let model: NwModel | null = null;
 let chat: NwChat | null = null;
+/** tokenize('') length for the current chat (BOS bias). */
+let tokenizeBaseline = 0;
+
 let generation: Promise<void> | null = null;
 let stopRequested = false;
+
+/** Serializes load/unload/reset. */
 let opChain: Promise<void> = Promise.resolve();
+let opPending = 0;
+/** Bumped by every loadModel/unloadModel call: only the latest request is allowed to change the model. */
+let loadSeq = 0;
+/** loadSeq of an unload scheduled by the last release(); retain() cancels it while it is still the latest. */
+let autoUnloadSeq: number | null = null;
+
 let downloadChain: Promise<void> = Promise.resolve();
 const pendingDownloads = new Map<ModelId, Promise<void>>();
+/** Set when downloads changed and models[] must be rebuilt. */
+let modelsDirty = false;
+
 let holders = 0;
 let releaseTimer: ReturnType<typeof setTimeout> | null = null;
 let messageSeq = 0;
@@ -101,14 +128,20 @@ function buildModels(loadState: LoadState): ModelEntry[] {
   }));
 }
 
+/** models[] is rebuilt only when loadState or downloads changed (not on every streamed token). */
 function setState(patch: Partial<EngineSnapshot>) {
-  const loadState = patch.loadState ?? state.loadState;
-  state = { ...state, ...patch, models: buildModels(loadState) };
+  const next = { ...state, ...patch };
+  if (modelsDirty || (patch.loadState !== undefined && patch.loadState !== state.loadState)) {
+    next.models = buildModels(next.loadState);
+    modelsDirty = false;
+  }
+  state = next;
   listeners.forEach((l) => l());
 }
 
 function setDownload(id: ModelId, next: ModelDownloadState) {
   downloads[id] = next;
+  modelsDirty = true;
   setState({});
 }
 
@@ -132,12 +165,14 @@ function classifyError(e: unknown, fallback: LoadErrorCode): LoadErrorCode {
   return fallback;
 }
 
-function enqueueOp<T>(op: () => Promise<T>): Promise<T> {
-  const run = opChain.then(op);
-  opChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
+function enqueueOp(op: () => Promise<void>): Promise<void> {
+  opPending += 1;
+  setState({ isBusy: true });
+  const run = opChain.then(op).finally(() => {
+    opPending -= 1;
+    setState({ isBusy: opPending > 0 });
+  });
+  opChain = run.catch(() => undefined);
   return run;
 }
 
@@ -145,12 +180,19 @@ function enqueueOp<T>(op: () => Promise<T>): Promise<T> {
 // Cache / downloads
 // ---------------------------------------------------------------------------
 
-/** "hf://owner/repo/file.gguf" -> "/owner/repo/file.gguf" (suffix of the cached absolute path). */
-function cacheSuffix(hfPath: string): string {
-  return `/${hfPath.replace(/^hf:\/\//, '')}`;
+type CachedFile = { path: string; size: number };
+
+/** "hf://owner/repo/file.gguf" -> ["owner", "repo", "file.gguf"] */
+function hfParts(hfPath: string): [string, string, string] {
+  const [owner, repo, ...rest] = hfPath.replace(/^hf:\/\//, '').split('/');
+  return [owner, repo, rest.join('/')];
 }
 
-function listCached(): { path: string; size: number }[] {
+function cacheSuffix(hfPath: string): string {
+  return `/${hfParts(hfPath).join('/')}`;
+}
+
+function listCached(): CachedFile[] {
   try {
     return getCachedModels().map((m) => ({ path: m.path, size: Number(m.size) }));
   } catch {
@@ -158,9 +200,13 @@ function listCached(): { path: string; size: number }[] {
   }
 }
 
-function findCached(cached: { path: string; size: number }[], hfPath: string) {
+function findCached(cached: CachedFile[], hfPath: string) {
   const suffix = cacheSuffix(hfPath);
   return cached.find((c) => c.path.endsWith(suffix) && c.path.includes('/nobodywho/models/'));
+}
+
+function pathToFileUri(path: string): string {
+  return `file://${encodeURI(path)}`;
 }
 
 function refreshDownloads() {
@@ -176,16 +222,20 @@ function refreshDownloads() {
       downloads[info.id] = { status: 'notDownloaded', cachedBytes: (m?.size ?? 0) + (p?.size ?? 0) };
     }
   }
+  modelsDirty = true;
   setState({});
 }
 
 function reportProgress(info: ModelInfo, file: DownloadFile, downloaded: number, total: number) {
   const offset = file === 'projection' ? info.modelBytes : 0;
   const totalBytes =
-    file === 'model' ? (total > 0 ? total : info.modelBytes) + info.projectionBytes : info.modelBytes + (total > 0 ? total : info.projectionBytes);
+    file === 'model'
+      ? (total > 0 ? total : info.modelBytes) + info.projectionBytes
+      : info.modelBytes + (total > 0 ? total : info.projectionBytes);
   const downloadedBytes = offset + downloaded;
   const progress = totalBytes > 0 ? Math.min(1, downloadedBytes / totalBytes) : 0;
   downloads[info.id] = { status: 'downloading', file, downloadedBytes, totalBytes, progress };
+  modelsDirty = true;
   const ls = state.loadState;
   if (ls.status === 'downloading' && ls.modelId === info.id) {
     setState({ loadState: { status: 'downloading', modelId: info.id, downloadedBytes, totalBytes, progress } });
@@ -231,10 +281,7 @@ function downloadInternal(id: ModelId): Promise<void> {
     }
   });
   pendingDownloads.set(id, run);
-  downloadChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
+  downloadChain = run.catch(() => undefined);
   return run;
 }
 
@@ -246,14 +293,31 @@ async function downloadModel(id: ModelId): Promise<void> {
   }
 }
 
+/** Cache directory of a model's HF repo (both files live in the same repo dir). */
+function repoDirectory(info: ModelInfo, cached: CachedFile[]): Directory {
+  const [owner, repo] = hfParts(info.modelPath);
+  const marker = `/nobodywho/models/${owner}/${repo}/`;
+  const hit = cached.find((c) => c.path.includes(marker));
+  if (hit) {
+    return new Directory(pathToFileUri(hit.path.slice(0, hit.path.indexOf(marker) + marker.length)));
+  }
+  const any = cached.find((c) => c.path.includes('/nobodywho/models/'));
+  if (any) {
+    const root = any.path.slice(0, any.path.indexOf('/nobodywho/models/') + '/nobodywho/models/'.length);
+    return new Directory(pathToFileUri(`${root}${owner}/${repo}/`));
+  }
+  // dirs::cache_dir() on iOS = <container>/Library/Caches = expo Paths.cache.
+  return new Directory(Paths.cache, 'nobodywho', 'models', owner, repo);
+}
+
 /**
- * Deletes the cached GGUF + mmproj files with expo-file-system.
+ * Deletes the cached GGUF + mmproj files (and leftover `*.part` temp files) with expo-file-system.
  * Safe because nobodywho treats "file exists" as the only cache marker for GGUF (no index/manifest),
- * so a deleted file is simply downloaded again next time. Refused while the model is loaded/loading
- * (llama.cpp may mmap the weights) or while it is downloading.
+ * so a deleted file is simply downloaded again next time. Ignored while the model is loaded/loading/pending
+ * (llama.cpp may mmap the weights) or while it is queued/downloading (the .part file is being written).
  */
 async function deleteModel(id: ModelId): Promise<void> {
-  if (activeModelId(state.loadState) === id) return;
+  if (activeModelId(state.loadState) === id || state.pendingModelId === id) return;
   const status = downloads[id].status;
   if (status === 'queued' || status === 'downloading') return;
 
@@ -264,12 +328,28 @@ async function deleteModel(id: ModelId): Promise<void> {
     const entry = findCached(cached, hfPath);
     if (!entry) continue;
     try {
-      const file = new File(`file://${encodeURI(entry.path)}`);
+      const file = new File(pathToFileUri(entry.path));
       if (file.exists) file.delete();
     } catch (e) {
       failure = errorMessage(e);
     }
   }
+
+  // Orphaned partial downloads (app killed mid-download): "<file>.<random>.part"
+  try {
+    const dir = repoDirectory(info, cached);
+    if (dir.exists) {
+      const prefixes = [info.modelPath, info.projectionPath].map((p) => `${hfParts(p)[2]}.`);
+      for (const item of dir.list()) {
+        if (item instanceof File && item.name.endsWith('.part') && prefixes.some((pre) => item.name.startsWith(pre))) {
+          item.delete();
+        }
+      }
+    }
+  } catch (e) {
+    failure = failure ?? errorMessage(e);
+  }
+
   downloads[id] = failure
     ? { status: 'error', message: `삭제 실패: ${failure}` }
     : { status: 'notDownloaded', cachedBytes: 0 };
@@ -292,84 +372,134 @@ async function stopAndWait() {
   }
 }
 
-function teardown() {
+function safeDestroy(target: { destroy(): void } | null) {
   try {
-    chat?.destroy();
+    target?.destroy();
   } catch {
     // already destroyed
   }
-  try {
-    model?.destroy();
-  } catch {
-    // already destroyed
-  }
-  chat = null;
-  model = null;
 }
 
-function loadModel(id: ModelId): Promise<void> {
-  return enqueueOp(async () => {
-    if (state.loadState.status === 'ready' && state.loadState.modelId === id && chat) return;
-    refreshDownloads();
+function teardown() {
+  safeDestroy(chat);
+  safeDestroy(model);
+  chat = null;
+  model = null;
+  tokenizeBaseline = 0;
+}
 
-    await stopAndWait();
-    teardown();
-    setState({ messages: [], contextUsage: null, isGenerating: false });
+/**
+ * Latest request wins: every call bumps loadSeq, and the op bails out after each await if a newer
+ * loadModel/unloadModel was issued (a Model that finished loading in the meantime is destroyed).
+ * Download runs outside the op queue and before teardown, so the current model stays loaded and usable
+ * while another model downloads, and stays loaded if that download fails.
+ */
+async function loadModel(id: ModelId): Promise<void> {
+  const mySeq = ++loadSeq;
+  const isStale = () => mySeq !== loadSeq;
 
-    const info = getModelInfo(id);
+  refreshDownloads();
+  if (state.loadState.status === 'ready' && state.loadState.modelId === id && chat) {
+    setState({ pendingModelId: null });
+    return;
+  }
+  const info = getModelInfo(id);
+  setState({ pendingModelId: id });
 
-    if (downloads[id].status !== 'downloaded') {
+  if (downloads[id].status !== 'downloaded') {
+    if (state.loadState.status !== 'ready') {
       setState({
         loadState: { status: 'downloading', modelId: id, downloadedBytes: 0, totalBytes: info.downloadBytes, progress: 0 },
       });
-      try {
-        await downloadInternal(id);
-      } catch (e) {
-        setState({ loadState: { status: 'error', modelId: id, code: 'download_failed', message: errorMessage(e) } });
-        return;
-      }
     }
-
-    setState({ loadState: { status: 'loading', modelId: id } });
-    let loaded: NwModel | null = null;
     try {
-      // Cache hit -> returns local paths without network.
+      await downloadInternal(id);
+    } catch (e) {
+      if (isStale()) return;
+      refreshDownloads();
+      setState({
+        pendingModelId: null,
+        // Keep a ready model as-is; the failure is visible in models[].download.
+        ...(state.loadState.status === 'ready'
+          ? {}
+          : { loadState: { status: 'error', modelId: id, code: 'download_failed', message: errorMessage(e) } }),
+      });
+      return;
+    }
+    if (isStale()) return;
+  }
+
+  await enqueueOp(async () => {
+    if (isStale()) return;
+    await stopAndWait();
+    if (isStale()) return;
+
+    teardown();
+    setState({ loadState: { status: 'loading', modelId: id }, messages: [], contextUsage: null, isGenerating: false });
+
+    let loaded: NwModel | null = null;
+    let created: NwChat | null = null;
+    try {
+      // Cache hit -> returns local paths without network. Re-downloads if the OS purged the cache meanwhile.
       const paths = await downloadFiles(info);
+      if (isStale()) return;
       const started = performance.now();
       loaded = await Model.load({ modelPath: paths.modelPath, projectionModelPath: paths.projectionPath, useGpu: true });
-      const created = new Chat({
+      if (isStale()) {
+        safeDestroy(loaded);
+        return;
+      }
+      created = new Chat({
         model: loaded,
         systemPrompt: SYSTEM_PROMPT,
         contextSize: CONTEXT_SIZE,
         templateVariables: TEMPLATE_VARIABLES,
       });
       const loadMs = performance.now() - started;
+      const stats = await created.getStats();
+      const baseline = (await created.tokenize('')).length;
+      if (isStale()) {
+        safeDestroy(created);
+        safeDestroy(loaded);
+        return;
+      }
       model = loaded;
       chat = created;
-      const stats = await created.getStats();
+      tokenizeBaseline = baseline;
       setState({
         loadState: { status: 'ready', modelId: id, loadMs, contextSize: stats.contextSize },
+        pendingModelId: null,
         contextUsage: { used: stats.contextUsed, size: stats.contextSize },
       });
     } catch (e) {
-      try {
-        loaded?.destroy();
-      } catch {
-        // ignore
-      }
+      safeDestroy(created);
+      safeDestroy(loaded);
+      if (isStale()) return;
       teardown();
       setState({
         loadState: { status: 'error', modelId: id, code: classifyError(e, 'load_failed'), message: errorMessage(e) },
+        pendingModelId: null,
       });
+    } finally {
+      refreshDownloads();
     }
   });
 }
 
 function unloadModel(): Promise<void> {
+  const mySeq = ++loadSeq;
   return enqueueOp(async () => {
+    if (mySeq !== loadSeq) return;
     await stopAndWait();
+    if (mySeq !== loadSeq) return;
     teardown();
-    setState({ loadState: { status: 'idle' }, messages: [], contextUsage: null, isGenerating: false });
+    setState({
+      loadState: { status: 'idle' },
+      pendingModelId: null,
+      messages: [],
+      contextUsage: null,
+      isGenerating: false,
+    });
   });
 }
 
@@ -377,8 +507,14 @@ function unloadModel(): Promise<void> {
 // Chat
 // ---------------------------------------------------------------------------
 
+async function countTokens(activeChat: NwChat, text: string): Promise<number> {
+  if (!text) return 0;
+  return Math.max(0, (await activeChat.tokenize(text)).length - tokenizeBaseline);
+}
+
 async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendInput) {
   const text = input.text.trim();
+  const maxOutputTokens = Math.max(1, Math.floor(input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS));
   const userMsg: ChatMessage = { id: nextMessageId(), role: 'user', text, imageUri: input.imageUri };
   const assistantId = nextMessageId();
   const assistantMsg: ChatMessage = { id: assistantId, role: 'assistant', text: '', status: 'streaming' };
@@ -399,20 +535,40 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
     }
 
     const before = await activeChat.getStats();
+    if (stopRequested) {
+      updateMessage(assistantId, { status: 'stopped' });
+      return;
+    }
+
     const started = performance.now();
     let firstAt: number | null = null;
     let lastAt = started;
+    let events = 0;
+    let stopSent = false;
+    let hitTokenCap = false;
+    // Never `break`: the stream is always consumed to its natural end so the chat worker finishes the turn.
     for await (const token of activeChat.ask(prompt)) {
       const now = performance.now();
       if (firstAt === null && token.length > 0) firstAt = now;
       lastAt = now;
       acc += token;
+      events += 1;
+      if (!stopSent && events >= maxOutputTokens && !stopRequested) {
+        hitTokenCap = true;
+        activeChat.stopGeneration();
+        stopSent = true;
+      }
+      // ask() resets should_stop at turn start, so a stop() issued before that is re-sent here.
+      if (stopRequested && !stopSent) {
+        activeChat.stopGeneration();
+        stopSent = true;
+      }
       updateMessage(assistantId, { text: acc });
     }
     const endedAt = performance.now();
 
     const after = await activeChat.getStats();
-    const outputTokens = acc.length > 0 ? (await activeChat.tokenize(acc)).length : 0;
+    const outputTokens = await countTokens(activeChat, acc);
     let imageTokens: number | undefined;
     if (typeof prompt !== 'string') {
       try {
@@ -424,6 +580,7 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
     const delta = after.contextUsed - before.contextUsed;
     const firstTokenAt = firstAt ?? endedAt;
     const decodeMs = Math.max(0, lastAt - firstTokenAt);
+    const userStopped = stopRequested && !hitTokenCap;
     const metrics: ResponseMetrics = {
       ttftMs: firstTokenAt - started,
       totalMs: endedAt - started,
@@ -434,10 +591,12 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
       imageTokens,
       imagePrepMs,
       contextUsed: after.contextUsed,
-      stopped: stopRequested,
+      stopped: userStopped,
+      hitTokenCap,
+      maxOutputTokens,
       modelId,
     };
-    updateMessage(assistantId, { status: stopRequested ? 'stopped' : 'done', metrics });
+    updateMessage(assistantId, { status: userStopped ? 'stopped' : 'done', metrics });
     setState({ contextUsage: { used: after.contextUsed, size: after.contextSize } });
   } catch (e) {
     updateMessage(assistantId, { status: 'error', error: errorMessage(e), text: acc });
@@ -447,6 +606,8 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
 async function send(input: SendInput): Promise<void> {
   const ls = state.loadState;
   if (ls.status !== 'ready' || !chat || generation) return;
+  // A load/unload/reset is queued or running: it would destroy or reset this chat mid-turn.
+  if (opPending > 0) return;
   if (!input.text.trim() && !input.imageUri) return;
 
   stopRequested = false;
@@ -488,6 +649,11 @@ function reset(): Promise<void> {
   });
 }
 
+// iOS forbids Metal command submission in the background -> stop generating when the app is backgrounded.
+AppState.addEventListener('change', (next) => {
+  if (next === 'background') stop();
+});
+
 // ---------------------------------------------------------------------------
 // Lifetime
 // ---------------------------------------------------------------------------
@@ -498,6 +664,12 @@ function retain(): () => void {
     clearTimeout(releaseTimer);
     releaseTimer = null;
   }
+  // An auto-unload already queued (screen left and re-entered quickly) is cancelled while it is still
+  // the latest request. Bumping loadSeq makes its op bail out.
+  if (autoUnloadSeq !== null && autoUnloadSeq === loadSeq) {
+    loadSeq += 1;
+  }
+  autoUnloadSeq = null;
   let released = false;
   return () => {
     if (released) return;
@@ -507,7 +679,9 @@ function retain(): () => void {
     // Deferred so StrictMode / fast-refresh remounts do not unload the model.
     releaseTimer = setTimeout(() => {
       releaseTimer = null;
-      if (holders === 0) void unloadModel();
+      if (holders !== 0) return;
+      void unloadModel();
+      autoUnloadSeq = loadSeq;
     }, 0);
   };
 }

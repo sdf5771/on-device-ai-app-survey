@@ -13,6 +13,7 @@
       "bundleIdentifier": "com.seobisback.on-device-ai-app-survey"
     },
     "android": {
+      "package": "com.seobisback.ondeviceaiappsurvey",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",

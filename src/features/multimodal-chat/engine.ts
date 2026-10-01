@@ -20,6 +20,8 @@ const snapshot: EngineSnapshot = {
   loadState: { status: 'unsupported' },
   messages: [],
   isGenerating: false,
+  isBusy: false,
+  pendingModelId: null,
   contextUsage: null,
 };
 
