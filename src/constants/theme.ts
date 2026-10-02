@@ -71,5 +71,7 @@ export const Spacing = {
   six: 64,
 } as const;
 
-export const BottomTabInset = Platform.select({ ios: 50, android: 80 }) ?? 0;
+// iPadOS 18+ shows the native tab bar at the top, so no bottom space is reserved there.
+const isIPad = Platform.OS === 'ios' && Platform.isPad;
+export const BottomTabInset = Platform.select({ ios: isIPad ? 0 : 50, android: 80 }) ?? 0;
 export const MaxContentWidth = 800;
