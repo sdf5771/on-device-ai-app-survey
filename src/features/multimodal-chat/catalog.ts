@@ -19,6 +19,20 @@ const RUNTIME_OVERHEAD_BYTES = 400 * MB;
 export const CONTEXT_SIZE = 4096;
 
 /**
+ * Context guard (engine send()): chat-template tokens around one user turn that tokenize(prompt) does not see
+ * (Qwen: `<|im_start|>user\n ... <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n` ~ 20).
+ * Added to the prompt estimate. Estimate.
+ */
+export const CONTEXT_TEMPLATE_MARGIN = 32;
+
+/**
+ * Context guard (engine send()): extra reserve on top of maxOutputTokens. Covers tokens generated between
+ * stopGeneration() and the actual stop (cap is counted in stream events), and the re-rendered previous
+ * assistant turn that nobodywho may re-read. Estimate.
+ */
+export const CONTEXT_SAFETY_MARGIN = 64;
+
+/**
  * Safety cap on output length per response (runaway generation guard). Overridable per send().
  * research D-2 benchmark uses 256.
  */
