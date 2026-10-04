@@ -6,6 +6,15 @@
 
 export type ModelId = 'qwen3.5-0.8b' | 'qwen3.5-2b' | 'qwen3.5-4b' | 'gemma4-e2b';
 
+/**
+ * How llama.cpp advances the position counter (nobodywho getStats().contextUsed) for one image:
+ * - mrope: by max(grid_w, grid_h) only, while the image takes grid_w * grid_h KV cells (Qwen-VL family, Qwen3.5).
+ * - linear: by every image token (positions == KV cells).
+ * - unknown: not confirmed -> detected at runtime on the first image turn.
+ * Source: llama.cpp mtmd.cpp (pos_type from llama_model_rope_type: MROPE/IMROPE -> mrope, NONE/NORM/NEOX -> linear).
+ */
+export type ImagePositionMode = 'mrope' | 'linear' | 'unknown';
+
 export type ModelInfo = {
   id: ModelId;
   /** Display name, e.g. "Qwen3.5 2B". */
@@ -26,6 +35,8 @@ export type ModelInfo = {
   /** Estimated peak resident memory when loaded (weights + mmproj + KV@4096 + runtime). Estimate, not measured. */
   estimatedMemoryBytes: number;
   license: string;
+  /** Image position mode of this model's decoder (context accounting). See ImagePositionMode. */
+  positionMode: ImagePositionMode;
 };
 
 /**
@@ -137,7 +148,12 @@ export type ContextCheck = {
   maxOutputTokens: number;
   /** CONTEXT_SAFETY_MARGIN (stop latency, re-read template tokens). */
   margin: number;
-  /** used + promptTokens + maxOutputTokens + margin. */
+  /**
+   * Cells nobodywho will re-append this turn: while an image sits in the KV (hiddenImageCells > 0) it cannot trim
+   * the previous answer and reads it again (previous answer tokens + REREAD_TEMPLATE_TOKENS). 0 otherwise.
+   */
+  rereadTokens: number;
+  /** used + promptTokens + rereadTokens + maxOutputTokens + margin. */
   required: number;
   size: number;
 };
@@ -149,6 +165,11 @@ export type ChatMessage = {
   text: string;
   /** user only: the original URI passed to send() (expo-image-picker result as-is). */
   imageUri?: string;
+  /**
+   * user only. true when this message never reached the model (its turn was refused with errorCode 'context_full').
+   * It is shown in the list but is NOT part of the model's history -> show it as "not sent".
+   */
+  notSent?: boolean;
   /** assistant only. */
   status?: ChatMessageStatus;
   /**

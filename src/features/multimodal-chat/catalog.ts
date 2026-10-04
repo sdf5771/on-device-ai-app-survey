@@ -33,6 +33,13 @@ export const CONTEXT_TEMPLATE_MARGIN = 32;
 export const CONTEXT_SAFETY_MARGIN = 64;
 
 /**
+ * Context guard (engine send()): template tokens around the previous answer when nobodywho re-reads it
+ * (measured +4 on Qwen3.5 0.8B: `<think>\n\n</think>\n\n` block). Rounded up. Added to the previous answer's
+ * token count while images are in the KV. Estimate.
+ */
+export const REREAD_TEMPLATE_TOKENS = 8;
+
+/**
  * Safety cap on output length per response (runaway generation guard). Overridable per send().
  * research D-2 benchmark uses 256.
  */
@@ -58,6 +65,9 @@ const SEEDS: CatalogSeed[] = [
     projectionBytes: 207_346_528,
     kvCacheBytes: 50 * MB,
     license: 'Apache-2.0',
+    // LLM_ARCH_QWEN35 -> LLAMA_ROPE_TYPE_IMROPE -> MTMD_POS_TYPE_MROPE (llama.cpp master, 2026-10-04).
+    // Measured on the simulator: 578 image tokens, positions +24.
+    positionMode: 'mrope',
   },
   {
     id: 'qwen3.5-2b',
@@ -70,6 +80,7 @@ const SEEDS: CatalogSeed[] = [
     projectionBytes: 671_372_992,
     kvCacheBytes: 50 * MB,
     license: 'Apache-2.0',
+    positionMode: 'mrope', // same arch as 0.8B (code-confirmed, not measured)
   },
   {
     id: 'qwen3.5-4b',
@@ -82,6 +93,7 @@ const SEEDS: CatalogSeed[] = [
     projectionBytes: 675_569_344,
     kvCacheBytes: 134 * MB,
     license: 'Apache-2.0',
+    positionMode: 'mrope', // same arch as 0.8B (code-confirmed, not measured)
   },
   {
     id: 'gemma4-e2b',
@@ -95,6 +107,8 @@ const SEEDS: CatalogSeed[] = [
     // Not computed in research (SWA + shared KV, expected small). Assumed 150MB. Estimate.
     kvCacheBytes: 150 * MB,
     license: 'Apache-2.0',
+    // LLM_ARCH_GEMMA4 -> LLAMA_ROPE_TYPE_NEOX -> MTMD_POS_TYPE_NORMAL (llama.cpp master, 2026-10-04). Not measured.
+    positionMode: 'linear',
   },
 ];
 
