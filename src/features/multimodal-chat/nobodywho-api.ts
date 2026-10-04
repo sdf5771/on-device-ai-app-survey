@@ -36,7 +36,13 @@ export interface NwPromptPart {
 export interface NwChat {
   ask(message: string | NwPrompt): AsyncIterable<string>;
   stopGeneration(): void;
+  /** Clears messages only. Does NOT touch the KV cache / position counter until the next ask() (core set_chat_history). */
   resetHistory(): Promise<void>;
+  /**
+   * Clears messages, the KV cache (n_past = 0) and the KV mirror (core reset_chat -> engine.reset_context).
+   * Template variables and sampler config are kept. systemPrompt undefined = no system prompt.
+   */
+  resetContext(opts?: { systemPrompt?: string }): Promise<void>;
   getStats(): Promise<NwChatStats>;
   /** Image/audio embedding slots are `undefined` at runtime (generated bindings), documented as `null`. */
   tokenize(message: string | NwPrompt): Promise<(number | null | undefined)[]>;

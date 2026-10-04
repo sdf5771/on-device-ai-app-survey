@@ -14,6 +14,18 @@
  *   before generation actually begins is lost -> we re-send it from inside the stream loop.
  * - tokenize(text) may prepend BOS (core tokenizer.rs tokenize_text AddBos) -> subtract tokenize('') baseline.
  * - No delete API, no available-memory API, no perf stats API.
+ *
+ * Context accounting (agent-log BUG-2/BUG-3, react-native-nobodywho 4.0.0 + llama.cpp mtmd, checked 2026-10-04):
+ * - getStats().contextUsed = InferenceEngine.n_past = llama.cpp POSITION counter, not KV cells.
+ *   For M-RoPE vision models (Qwen-VL family incl. Qwen3.5) mtmd advances n_past by max(grid_w, grid_h) per image
+ *   (mtmd_image_tokens_get_n_pos) while the image takes grid_w*grid_h KV cells -> an image is ~95% invisible.
+ *   -> we track those hidden cells per image turn (hiddenImageCells) and report used = positions + hidden.
+ * - nobodywho's own context shift / KV trimming compares token indices (chunk n_tokens, images counted in full)
+ *   with n_past (positions) -> with an M-RoPE image in the KV it neither trims the KV nor re-reads the prompt
+ *   correctly. So when images are involved the engine never lets a turn reach the shift: send() refuses with
+ *   errorCode 'context_full' if used + prompt + maxOutputTokens + margin > contextSize.
+ * - resetHistory() only clears messages; the KV / n_past are trimmed lazily on the next ask -> reset() uses
+ *   resetContext() (core reset_chat: clears KV, n_past = 0, KV mirror), so getStats() is 0 right after reset.
  */
 import * as Device from 'expo-device';
 import { Directory, File, Paths } from 'expo-file-system';
@@ -21,17 +33,22 @@ import { AppState } from 'react-native';
 
 import {
   assessFit,
+  CONTEXT_SAFETY_MARGIN,
   CONTEXT_SIZE,
+  CONTEXT_TEMPLATE_MARGIN,
   DEFAULT_MAX_OUTPUT_TOKENS,
   getDeviceMemoryInfo,
   getModelInfo,
   MODEL_CATALOG,
+  REREAD_TEMPLATE_TOKENS,
 } from './catalog';
 import { prepareImage } from './image.native';
 import type {
   ChatMessage,
+  ContextCheck,
   ContextUsage,
   DownloadFile,
+  ImagePositionMode,
   Engine,
   EngineSnapshot,
   LoadErrorCode,
@@ -43,7 +60,7 @@ import type {
   ResponseMetrics,
   SendInput,
 } from './types';
-import type { NobodyWhoApi, NwChat, NwModel, NwPrompt } from './nobodywho-api';
+import type { NobodyWhoApi, NwChat, NwChatStats, NwModel, NwPrompt } from './nobodywho-api';
 
 // Typed through a local facade (see nobodywho-api.ts): importing the package's raw .ts sources
 // makes `tsc --noEmit` fail inside node_modules (4.0.0 chat.ts tokenize type mismatch).
@@ -86,6 +103,25 @@ let model: NwModel | null = null;
 let chat: NwChat | null = null;
 /** tokenize('') length for the current chat (BOS bias). */
 let tokenizeBaseline = 0;
+/**
+ * KV cells occupied by images in the current context that getStats().contextUsed (positions) does not count.
+ * Reset to 0 with the KV cache (reset/load/unload). See the header comment.
+ */
+let hiddenImageCells = 0;
+/** true when hiddenImageCells is uncertain (fallback estimate, or a turn with images failed mid-way). */
+let usageEstimated = false;
+/**
+ * How llama.cpp positions advance for an image with the loaded model. Set from the catalog on load
+ * (ModelInfo.positionMode); 'unknown' is resolved by runtime detection on the first image turn.
+ */
+let imagePositionMode: ImagePositionMode = 'unknown';
+/** The catalog value was confirmed/contradicted by a runtime check already (check once per load). */
+let positionModeChecked = false;
+/**
+ * Output tokens of the last completed answer. While hiddenImageCells > 0 nobodywho re-reads this answer into the KV
+ * on the next turn (it cannot trim it, see header) -> reserved by the context guard. 0 after reset/load.
+ */
+let lastAnswerTokens = 0;
 
 let generation: Promise<void> | null = null;
 let stopRequested = false;
@@ -384,6 +420,26 @@ function teardown() {
   chat = null;
   model = null;
   tokenizeBaseline = 0;
+  resetContextAccounting();
+  imagePositionMode = 'unknown';
+  positionModeChecked = false;
+}
+
+/** KV is empty again (reset / new chat): forget everything derived from the old KV contents. */
+function resetContextAccounting() {
+  hiddenImageCells = 0;
+  usageEstimated = false;
+  lastAnswerTokens = 0;
+}
+
+function toUsage(stats: NwChatStats): ContextUsage {
+  return {
+    used: stats.contextUsed + hiddenImageCells,
+    size: stats.contextSize,
+    positionsUsed: stats.contextUsed,
+    hiddenImageCells,
+    estimated: usageEstimated,
+  };
 }
 
 /** The latest loadModel request (for de-duplicating repeated calls). null after an unload request. */
@@ -511,10 +567,12 @@ async function loadModel(id: ModelId): Promise<void> {
       model = loaded;
       chat = created;
       tokenizeBaseline = baseline;
+      imagePositionMode = info.positionMode;
+      positionModeChecked = false;
       setState({
         loadState: { status: 'ready', modelId: id, loadMs, contextSize: stats.contextSize },
         pendingModelId: null,
-        contextUsage: { used: stats.contextUsed, size: stats.contextSize },
+        contextUsage: toUsage(stats),
       });
     } catch (e) {
       safeDestroy(created);
@@ -574,6 +632,85 @@ async function countTokens(activeChat: NwChat, text: string): Promise<number> {
   return Math.max(0, (await activeChat.tokenize(text)).length - tokenizeBaseline);
 }
 
+type PromptCost = { textTokens: number; imageTokens: number };
+
+/**
+ * KV cost of the user content, without chat template. tokenize(Prompt) loads + preprocesses the image
+ * (mtmd tokenize, no vision encoding). Image slots (incl. mtmd's wrapper tokens such as <|vision_start|>) are null.
+ */
+async function promptCost(activeChat: NwChat, prompt: string | NwPrompt): Promise<PromptCost> {
+  const ids = await activeChat.tokenize(prompt);
+  let imageTokens = 0;
+  for (const t of ids) if (t == null) imageTokens += 1;
+  return { textTokens: Math.max(0, ids.length - imageTokens - tokenizeBaseline), imageTokens };
+}
+
+/**
+ * Runtime cross-check of the image position mode on a completed image turn.
+ * Linear lower bound: with linear positions the prompt advances by at least textTokens + imageTokens
+ * (+ chat template). Fewer positions than that can only mean the image advanced by less than its token count -> mrope.
+ * Only trusted while hiddenImageCells == 0 (afterwards nobodywho re-reads the previous answer every turn, which
+ * inflates promptPositions). Catalog value wins; a mismatch is logged for investigation.
+ */
+function crossCheckPositionMode(promptPositions: number, textTokens: number, imageTokens: number) {
+  if (positionModeChecked || hiddenImageCells > 0 || promptPositions <= 0 || imageTokens <= 0) return;
+  positionModeChecked = true;
+  const detected: ImagePositionMode = promptPositions < textTokens + imageTokens ? 'mrope' : 'linear';
+  if (imagePositionMode === 'unknown') {
+    imagePositionMode = detected;
+  } else if (imagePositionMode !== detected) {
+    console.warn(
+      `[multimodal-chat] image position mode mismatch: catalog=${imagePositionMode} detected=${detected} ` +
+        `(promptPositions=${promptPositions}, textTokens=${textTokens}, imageTokens=${imageTokens}). Using catalog.`,
+    );
+  }
+}
+
+/**
+ * KV cells of ONE image that the position counter did not advance for.
+ * Invariant: exactly one image per turn (SendInput has a single imageUri). With several images in a prompt the
+ * sqrt estimate below would have to be applied per image with each image's own size.
+ * - linear: 0.
+ * - mrope: positions advanced by ~max(grid_w, grid_h); long grid side ~ sqrt(n * aspect)
+ *   (mtmd: n = grid_w * grid_h, plus a couple of wrapper tokens like <|vision_start|>). Error: a few cells per image.
+ * - unknown (not resolved): whole image counted (over-estimate by ~max(grid) -> safe side), exact = false.
+ */
+function hiddenCellsForImage(imageTokens: number, width: number, height: number): { hidden: number; exact: boolean } {
+  if (imageTokens <= 0 || imagePositionMode === 'linear') return { hidden: 0, exact: true };
+  const aspect = width > 0 && height > 0 ? Math.max(width, height) / Math.min(width, height) : 0;
+  if (imagePositionMode === 'unknown' || !Number.isFinite(aspect) || aspect <= 0) {
+    return { hidden: imageTokens, exact: false };
+  }
+  const imagePositions = Math.round(Math.sqrt(imageTokens * aspect));
+  return { hidden: Math.max(0, imageTokens - imagePositions), exact: true };
+}
+
+/**
+ * Cells nobodywho will append on the next turn ON TOP of the new prompt, because it cannot trim the previous answer.
+ *
+ * Mechanism (core inference.rs sync_context, 4.0.0): the re-rendered history differs from the KV mirror inside the
+ * previous assistant turn (Qwen template drops the `<think></think>` block from past turns). That diff index is in
+ * TOKEN space (images counted in full) and is compared with n_past (POSITION space):
+ * - previous answer shorter than the hidden image cells -> n_past <= index -> early return, nothing trimmed, the
+ *   answer is appended again: +answer +~4 cells (measured: 13-token answer -> +17).
+ * - longer answer -> n_past > index -> seq_rm; Qwen3.5 is hybrid (recurrent layers) so partial removal fails and
+ *   nobodywho resets the KV and re-reads the whole history (no extra cells, but image re-encoding in TTFT;
+ *   measured: 701/776-token answers -> +0 cells, text-turn TTFT ~36 s on the simulator CPU).
+ * The boundary is fuzzy by a few tokens (template), so a band of REREAD_TEMPLATE_TOKENS * 2 is reserved as "re-read".
+ * Assumption: every 'mrope' model in the catalog is Qwen3.5 (hybrid). A non-hybrid M-RoPE model would take a
+ * partial seq_rm at a token-space index instead (different, also broken, behaviour) -> re-check before adding one.
+ */
+function expectedRereadTokens(): number {
+  if (hiddenImageCells <= 0 || lastAnswerTokens <= 0) return 0;
+  const reread = lastAnswerTokens + REREAD_TEMPLATE_TOKENS;
+  return reread <= hiddenImageCells + REREAD_TEMPLATE_TOKENS * 2 ? reread : 0;
+}
+
+function contextGuardNeeded(hasImage: boolean): boolean {
+  // Text-only context: positions == KV cells, so nobodywho's own context shift works -> leave it alone.
+  return hasImage || hiddenImageCells > 0;
+}
+
 async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendInput) {
   const text = input.text.trim();
   const maxOutputTokens = Math.max(1, Math.floor(input.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS));
@@ -583,12 +720,17 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
   setState({ messages: [...state.messages, userMsg, assistantMsg], isGenerating: true });
 
   let acc = '';
+  let askStarted = false;
+  /** Image tokens of this turn not yet accounted in hiddenImageCells (for the error path). */
+  let pendingImageCells = 0;
   try {
     let prompt: string | NwPrompt = text;
     let imagePrepMs: number | undefined;
+    let imageSize = { width: 0, height: 0 };
     if (input.imageUri) {
       const prepared = await prepareImage(input.imageUri);
       imagePrepMs = prepared.prepMs;
+      imageSize = { width: prepared.width, height: prepared.height };
       prompt = new Prompt(text ? [Prompt.Image(prepared.path), Prompt.Text(text)] : [Prompt.Image(prepared.path)]);
     }
     if (stopRequested) {
@@ -597,10 +739,42 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
     }
 
     const before = await activeChat.getStats();
+    const cost = await promptCost(activeChat, prompt);
+    const imageTokens = typeof prompt !== 'string' ? cost.imageTokens : undefined;
     if (stopRequested) {
       updateMessage(assistantId, { status: 'stopped' });
       return;
     }
+
+    // Deterministic refusal instead of letting nobodywho reach its (image-unsafe) context shift / KV overflow.
+    if (contextGuardNeeded(typeof prompt !== 'string')) {
+      const used = before.contextUsed + hiddenImageCells;
+      const promptTokens = cost.textTokens + cost.imageTokens + CONTEXT_TEMPLATE_MARGIN;
+      const rereadTokens = expectedRereadTokens();
+      const required = used + promptTokens + rereadTokens + maxOutputTokens + CONTEXT_SAFETY_MARGIN;
+      if (required > before.contextSize) {
+        const check: ContextCheck = {
+          used,
+          promptTokens,
+          maxOutputTokens,
+          margin: CONTEXT_SAFETY_MARGIN,
+          rereadTokens,
+          required,
+          size: before.contextSize,
+        };
+        updateMessage(userMsg.id, { notSent: true });
+        updateMessage(assistantId, {
+          status: 'error',
+          errorCode: 'context_full',
+          contextCheck: check,
+          error: `컨텍스트 부족: 필요 ${required} / ${before.contextSize} 토큰. 대화를 초기화하세요.`,
+        });
+        setState({ contextUsage: toUsage(before) });
+        return;
+      }
+    }
+
+    pendingImageCells = cost.imageTokens;
 
     const started = performance.now();
     let firstAt: number | null = null;
@@ -609,6 +783,7 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
     let stopSent = false;
     let hitTokenCap = false;
     // Never `break`: the stream is always consumed to its natural end so the chat worker finishes the turn.
+    askStarted = true;
     for await (const token of activeChat.ask(prompt)) {
       const now = performance.now();
       if (firstAt === null && token.length > 0) firstAt = now;
@@ -631,15 +806,26 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
 
     const after = await activeChat.getStats();
     const outputTokens = await countTokens(activeChat, acc);
-    let imageTokens: number | undefined;
-    if (typeof prompt !== 'string') {
-      try {
-        imageTokens = (await activeChat.tokenize(prompt)).filter((t) => t == null).length;
-      } catch {
-        imageTokens = undefined;
+    const positionsDelta = after.contextUsed - before.contextUsed;
+    let hiddenThisTurn = 0;
+    if (imageTokens) {
+      if (positionsDelta >= 0) crossCheckPositionMode(positionsDelta - outputTokens, cost.textTokens, imageTokens);
+      if (imagePositionMode === 'linear') {
+        hiddenThisTurn = 0;
+      } else if (positionsDelta < 0) {
+        // The library shifted/reset its KV during this turn (should not happen behind the guard): unknown state.
+        hiddenThisTurn = imageTokens;
+        usageEstimated = true;
+      } else {
+        const r = hiddenCellsForImage(imageTokens, imageSize.width, imageSize.height);
+        hiddenThisTurn = r.hidden;
+        if (!r.exact) usageEstimated = true;
       }
+      hiddenImageCells += hiddenThisTurn;
     }
-    const delta = after.contextUsed - before.contextUsed;
+    pendingImageCells = 0;
+    lastAnswerTokens = outputTokens;
+    const delta = positionsDelta + hiddenThisTurn;
     const firstTokenAt = firstAt ?? endedAt;
     const decodeMs = Math.max(0, lastAt - firstTokenAt);
     const userStopped = stopRequested && !hitTokenCap;
@@ -652,16 +838,29 @@ async function runGeneration(activeChat: NwChat, modelId: ModelId, input: SendIn
       promptTokens: delta >= outputTokens ? delta - outputTokens : undefined,
       imageTokens,
       imagePrepMs,
-      contextUsed: after.contextUsed,
+      contextUsed: after.contextUsed + hiddenImageCells,
       stopped: userStopped,
       hitTokenCap,
       maxOutputTokens,
       modelId,
     };
     updateMessage(assistantId, { status: userStopped ? 'stopped' : 'done', metrics });
-    setState({ contextUsage: { used: after.contextUsed, size: after.contextSize } });
+    setState({ contextUsage: toUsage(after) });
   } catch (e) {
-    updateMessage(assistantId, { status: 'error', error: errorMessage(e), text: acc });
+    updateMessage(assistantId, { status: 'error', errorCode: 'generation_failed', error: errorMessage(e), text: acc });
+    if (askStarted && pendingImageCells > 0 && imagePositionMode !== 'linear') {
+      // The image stays in the library's history (it is re-read on the next turn) but how much of it is in the
+      // KV now is unknown -> count it in full and flag the gauge as an estimate until reset().
+      hiddenImageCells += pendingImageCells;
+      usageEstimated = true;
+    }
+    // Partial answer may or may not be in the library history: reserve what was streamed (safe side).
+    if (askStarted && acc) lastAnswerTokens = await countTokens(activeChat, acc).catch(() => lastAnswerTokens);
+    try {
+      setState({ contextUsage: toUsage(await activeChat.getStats()) });
+    } catch {
+      // keep the previous usage
+    }
   }
 }
 
@@ -700,11 +899,21 @@ function reset(): Promise<void> {
     let contextUsage: ContextUsage | null = null;
     if (chat) {
       try {
-        await chat.resetHistory();
-        const stats = await chat.getStats();
-        contextUsage = { used: stats.contextUsed, size: stats.contextSize };
+        // resetContext (not resetHistory): clears the KV cache and n_past now, so getStats() is ~0 right away.
+        // resetHistory only clears messages and leaves the KV to be trimmed on the next ask (BUG-2).
+        await chat.resetContext({ systemPrompt: SYSTEM_PROMPT });
+        resetContextAccounting();
       } catch {
-        contextUsage = state.contextUsage;
+        // resetContext failed: the KV is unchanged -> keep the previous usage.
+        setState({ messages: [], contextUsage: state.contextUsage });
+        return;
+      }
+      try {
+        contextUsage = toUsage(await chat.getStats());
+      } catch {
+        // resetContext succeeded, so the KV is empty even if the stats query failed.
+        const size = state.contextUsage?.size ?? CONTEXT_SIZE;
+        contextUsage = { used: 0, size, positionsUsed: 0, hiddenImageCells: 0, estimated: false };
       }
     }
     setState({ messages: [], contextUsage });
